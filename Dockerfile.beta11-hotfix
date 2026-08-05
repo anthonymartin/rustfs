@@ -23,8 +23,6 @@ RUN set -eux; \
       protobuf-compiler; \
     rm -rf /var/lib/apt/lists/*
 
-RUN rustup target add x86_64-unknown-linux-musl
-
 ENV CARGO_INCREMENTAL=0 \
     CARGO_NET_GIT_FETCH_WITH_CLI=true \
     CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse \
@@ -33,6 +31,11 @@ ENV CARGO_INCREMENTAL=0 \
 WORKDIR /usr/src/rustfs
 
 COPY . .
+
+# Resolve the repository's rust-toolchain.toml before installing the target.
+# Otherwise a later stable-channel update can leave the musl stdlib attached
+# to the base image's older toolchain instead of the one Cargo actually uses.
+RUN rustup target add x86_64-unknown-linux-musl
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
