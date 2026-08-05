@@ -1,0 +1,72 @@
+# syntax=docker/dockerfile:1.7
+
+# Build the beta.11 hotfix from this checkout, then replace only the RustFS
+# binary in the exact image currently deployed at Lone Pine. This keeps the
+# official beta.11 runtime, entrypoint, user, and filesystem contract intact.
+ARG RUSTFS_BASE_IMAGE=rustfs/rustfs:1.0.0-beta.11@sha256:84ce557a0245a06a9aae5516f55ee0f007fca78d41df356f419306fdc0cb168c
+
+FROM --platform=$BUILDPLATFORM rust:1.97-trixie AS builder
+
+RUN set -eux; \
+    export DEBIAN_FRONTEND=noninteractive; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      curl \
+      flatbuffers-compiler \
+      git \
+      libssl-dev \
+      lld \
+      musl-tools \
+      pkg-config \
+      protobuf-compiler; \
+    rm -rf /var/lib/apt/lists/*
+
+RUN rustup target add x86_64-unknown-linux-musl
+
+ENV CARGO_INCREMENTAL=0 \
+    CARGO_NET_GIT_FETCH_WITH_CLI=true \
+    CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse \
+    CARGO_TARGET_DIR=/usr/src/rustfs/target/hotfix-build
+
+WORKDIR /usr/src/rustfs
+
+COPY Cargo.toml Cargo.lock ./
+COPY rustfs/Cargo.toml rustfs/Cargo.toml
+COPY crates/*/Cargo.toml crates/
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    cargo fetch --locked
+
+COPY . .
+
+RUN ./scripts/static.sh
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/usr/src/rustfs/target/hotfix-build \
+    cargo run --locked --bin gproto
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/usr/src/rustfs/target/hotfix-build \
+    cargo build --locked --release --target x86_64-unknown-linux-musl -p rustfs --bin rustfs
+
+RUN install -m 0755 \
+    /usr/src/rustfs/target/hotfix-build/x86_64-unknown-linux-musl/release/rustfs \
+    /usr/local/bin/rustfs-hotfix
+
+FROM $RUSTFS_BASE_IMAGE
+
+ARG BUILD_DATE
+ARG VCS_REF
+
+COPY --from=builder /usr/local/bin/rustfs-hotfix /usr/bin/rustfs
+
+LABEL org.opencontainers.image.title="RustFS beta.11 heal hotfix" \
+      org.opencontainers.image.description="RustFS 1.0.0-beta.11 with bounded heal observability" \
+      org.opencontainers.image.version="1.0.0-beta.11-heal-hotfix" \
+      org.opencontainers.image.revision="$VCS_REF" \
+      org.opencontainers.image.created="$BUILD_DATE" \
+      org.opencontainers.image.source="https://github.com/anthonymartin/rustfs/tree/agent/beta11-bound-heal-observability" \
+      org.opencontainers.image.base.name="docker.io/rustfs/rustfs:1.0.0-beta.11@sha256:84ce557a0245a06a9aae5516f55ee0f007fca78d41df356f419306fdc0cb168c"
