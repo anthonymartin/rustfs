@@ -45,6 +45,8 @@ pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR;
 
 const DATA_USAGE_OBJ_NAME: &str = ".usage.json";
 
+const DATA_USAGE_OBSERVED_OBJ_NAME: &str = ".usage.observed.json";
+
 const DATA_USAGE_BLOOM_NAME: &str = ".bloomcycle.bin";
 
 pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
@@ -69,6 +71,9 @@ pub static DATA_USAGE_BUCKET: LazyLock<String> =
 
 pub static DATA_USAGE_OBJ_NAME_PATH: LazyLock<String> =
     LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}{DATA_USAGE_OBJ_NAME}"));
+
+pub static DATA_USAGE_OBSERVED_OBJ_NAME_PATH: LazyLock<String> =
+    LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}{DATA_USAGE_OBSERVED_OBJ_NAME}"));
 
 pub static DATA_USAGE_BLOOM_NAME_PATH: LazyLock<String> =
     LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}{DATA_USAGE_BLOOM_NAME}"));

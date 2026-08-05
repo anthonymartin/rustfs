@@ -542,11 +542,30 @@ fn classify_nsscanner_cycle(
     has_failed_buckets: bool,
     dirty_usage_current: bool,
 ) -> ScannerCycleStatus {
-    if completed_all_sets && !budget_elapsed && !cancelled && !has_failed_buckets && dirty_usage_current {
+    if !completed_all_sets || budget_elapsed || cancelled || has_failed_buckets {
+        return ScannerCycleStatus::Incomplete;
+    }
+
+    if dirty_usage_current {
         ScannerCycleStatus::Complete
     } else {
-        ScannerCycleStatus::Incomplete
+        ScannerCycleStatus::Superseded
     }
+}
+
+fn prepare_usage_snapshot_for_publication(
+    status: ScannerCycleStatus,
+    want_cycle: u64,
+    mut data_usage_info: DataUsageInfo,
+) -> Option<DataUsageInfo> {
+    if !matches!(status, ScannerCycleStatus::Complete | ScannerCycleStatus::Superseded) {
+        return None;
+    }
+
+    data_usage_info.scanner_cycle = Some(want_cycle);
+    data_usage_info.usage_snapshot_complete = true;
+    data_usage_info.usage_snapshot_converged = Some(status == ScannerCycleStatus::Complete);
+    Some(data_usage_info)
 }
 
 fn scanner_results_have_pending_maintenance_work(results: &[DataUsageCache]) -> bool {
@@ -594,10 +613,9 @@ fn completed_data_usage_info(
     all_buckets: &[String],
     budget_elapsed: bool,
     cancelled: bool,
-    dirty_usage_current: bool,
 ) -> Option<(DataUsageInfo, SystemTime)> {
     let completed_set_count = results.iter().filter(|result| result.info.last_update.is_some()).count();
-    if !should_publish_completed_snapshot(completed_set_count, results.len(), budget_elapsed, cancelled) || !dirty_usage_current {
+    if !should_publish_completed_snapshot(completed_set_count, results.len(), budget_elapsed, cancelled) {
         return None;
     }
 
@@ -652,20 +670,45 @@ mod publish_gate_tests {
         let first_set = completed_root_cache("bucket-a", 1, 10);
         let second_set = completed_root_cache("bucket-b", 2, 20);
 
-        assert!(
-            completed_data_usage_info(&[first_set.clone(), DataUsageCache::default()], &all_buckets, false, false, true)
-                .is_none()
-        );
-        assert!(completed_data_usage_info(&[first_set.clone(), second_set.clone()], &all_buckets, true, false, true).is_none());
-        assert!(completed_data_usage_info(&[first_set.clone(), second_set.clone()], &all_buckets, false, true, true).is_none());
-        assert!(completed_data_usage_info(&[first_set.clone(), second_set.clone()], &all_buckets, false, false, false).is_none());
+        assert!(completed_data_usage_info(&[first_set.clone(), DataUsageCache::default()], &all_buckets, false, false).is_none());
+        assert!(completed_data_usage_info(&[first_set.clone(), second_set.clone()], &all_buckets, true, false).is_none());
+        assert!(completed_data_usage_info(&[first_set.clone(), second_set.clone()], &all_buckets, false, true).is_none());
 
-        let (data_usage_info, last_update) =
-            completed_data_usage_info(&[first_set, second_set], &all_buckets, false, false, true)
-                .expect("all completed sets should produce a publishable data usage snapshot");
+        let (data_usage_info, last_update) = completed_data_usage_info(&[first_set, second_set], &all_buckets, false, false)
+            .expect("all completed sets should produce a publishable data usage snapshot");
         assert_eq!(last_update, SystemTime::UNIX_EPOCH + Duration::from_secs(20));
         assert_eq!(data_usage_info.objects_total_count, 3);
         assert_eq!(data_usage_info.buckets_usage.len(), 2);
+    }
+
+    #[test]
+    fn structurally_complete_dirty_cycles_are_superseded() {
+        assert_eq!(classify_nsscanner_cycle(true, false, false, false, true), ScannerCycleStatus::Complete);
+        assert_eq!(classify_nsscanner_cycle(true, false, false, false, false), ScannerCycleStatus::Superseded);
+        assert_eq!(
+            classify_nsscanner_cycle(false, false, false, false, false),
+            ScannerCycleStatus::Incomplete
+        );
+    }
+
+    #[test]
+    fn publication_marks_authoritative_and_observational_snapshots() {
+        let snapshot = DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+        let complete = prepare_usage_snapshot_for_publication(ScannerCycleStatus::Complete, 7, snapshot.clone())
+            .expect("complete snapshot should publish");
+        let superseded = prepare_usage_snapshot_for_publication(ScannerCycleStatus::Superseded, 8, snapshot)
+            .expect("superseded snapshot should publish");
+
+        assert_eq!(complete.scanner_cycle, Some(7));
+        assert_eq!(complete.usage_snapshot_converged, Some(true));
+        assert!(complete.is_complete_bucket_usage_snapshot());
+        assert_eq!(superseded.scanner_cycle, Some(8));
+        assert_eq!(superseded.usage_snapshot_converged, Some(false));
+        assert!(superseded.is_complete_bucket_usage_snapshot());
+        assert!(prepare_usage_snapshot_for_publication(ScannerCycleStatus::Incomplete, 9, DataUsageInfo::default()).is_none());
     }
 }
 
@@ -791,6 +834,7 @@ pub enum ScannerDiskScanOutcome {
 pub(crate) enum ScannerCycleStatus {
     Complete,
     Incomplete,
+    Superseded,
 }
 
 #[derive(Debug)]
@@ -879,26 +923,21 @@ impl ScannerIOCycle for ECStore {
 
         if all_buckets.is_empty() {
             reset_set_scan_gauges();
-            let empty_usage = DataUsageInfo {
-                last_update: Some(SystemTime::now()),
-                ..Default::default()
-            };
-            if let Err(e) = updates.send(empty_usage).await {
-                error!(
-                    target: "rustfs::scanner::io",
-                    event = EVENT_SCANNER_SET_STATE,
-                    component = LOG_COMPONENT_SCANNER,
-                    subsystem = LOG_SUBSYSTEM_IO,
-                    state = "empty_bucket_publish_failed",
-                    error = %e,
-                    "Scanner set state update failed"
-                );
-            }
             let status = if dirty_usage_snapshot_covers_current(&dirty_usage_snapshot) {
                 ScannerCycleStatus::Complete
             } else {
-                ScannerCycleStatus::Incomplete
+                ScannerCycleStatus::Superseded
             };
+            if let Some(empty_usage) = prepare_usage_snapshot_for_publication(
+                status,
+                want_cycle,
+                DataUsageInfo {
+                    last_update: Some(SystemTime::now()),
+                    ..Default::default()
+                },
+            ) {
+                send_merged_data_usage_update(&updates, empty_usage).await;
+            }
             let dirty_usage_clear =
                 (status == ScannerCycleStatus::Complete).then(|| dirty_usage_snapshot.buckets.as_ref().clone());
             return Ok(ScannerCycleResult::new(status, dirty_usage_clear));
@@ -1058,7 +1097,7 @@ impl ScannerIOCycle for ECStore {
         let results_mutex_for_updates = results_mutex.clone();
         let budget_for_updates = budget.clone();
         let child_token_for_updates = child_token.clone();
-        let dirty_usage_snapshot_for_updates = dirty_usage_snapshot.clone();
+        let updates_for_progress = updates.clone();
         tokio::spawn(async move {
             let mut last_update = SystemTime::UNIX_EPOCH;
             let mut has_sent_once = false;
@@ -1069,27 +1108,7 @@ impl ScannerIOCycle for ECStore {
                     _ = child_token_for_updates.cancelled() => {
                         break;
                     }
-                    res = &mut update_rx => {
-                        if res.is_err() {
-                            break;
-                        }
-
-                        let data_usage_update = {
-                            let results = results_mutex_for_updates.lock().await;
-                            completed_data_usage_info(
-                                &results,
-                                &all_buckets_clone,
-                                budget_for_updates.budget_elapsed(),
-                                child_token_for_updates.is_cancelled(),
-                                dirty_usage_snapshot_covers_current(dirty_usage_snapshot_for_updates.as_ref()),
-                            )
-                        };
-
-                        if let Some((data_usage_info, merged_last_update)) = data_usage_update
-                            && (!has_sent_once || merged_last_update > last_update)
-                        {
-                            send_merged_data_usage_update(&updates, data_usage_info).await;
-                        }
+                    _ = &mut update_rx => {
                         break;
                     }
                     _ = ticker.tick() => {
@@ -1100,14 +1119,18 @@ impl ScannerIOCycle for ECStore {
                                 &all_buckets_clone,
                                 budget_for_updates.budget_elapsed(),
                                 child_token_for_updates.is_cancelled(),
-                                dirty_usage_snapshot_covers_current(dirty_usage_snapshot_for_updates.as_ref()),
                             )
                         };
 
                         if let Some((data_usage_info, merged_last_update)) = data_usage_update
                             && (!has_sent_once || merged_last_update > last_update)
+                            && let Some(data_usage_info) = prepare_usage_snapshot_for_publication(
+                                ScannerCycleStatus::Superseded,
+                                want_cycle,
+                                data_usage_info,
+                            )
                         {
-                            send_merged_data_usage_update(&updates, data_usage_info).await;
+                            send_merged_data_usage_update(&updates_for_progress, data_usage_info).await;
                             has_sent_once = true;
                             last_update = merged_last_update;
                         }
@@ -1152,14 +1175,27 @@ impl ScannerIOCycle for ECStore {
             !failed_buckets.is_empty(),
             dirty_usage_current,
         );
-        let dirty_usage_clear = should_clear_dirty_usage_snapshot(
-            result.is_ok(),
-            completed_all_sets,
-            budget_elapsed,
-            &dirty_usage_snapshot.buckets,
-            &failed_buckets,
-        );
         result?;
+        if let Some((data_usage_info, _)) = completed_data_usage_info(
+            &results,
+            &all_buckets.iter().map(|bucket| bucket.name.clone()).collect::<Vec<_>>(),
+            budget_elapsed,
+            ctx.is_cancelled(),
+        ) && let Some(data_usage_info) = prepare_usage_snapshot_for_publication(cycle_status, want_cycle, data_usage_info)
+        {
+            send_merged_data_usage_update(&updates, data_usage_info).await;
+        }
+        let dirty_usage_clear = (cycle_status == ScannerCycleStatus::Complete)
+            .then(|| {
+                should_clear_dirty_usage_snapshot(
+                    true,
+                    completed_all_sets,
+                    budget_elapsed,
+                    &dirty_usage_snapshot.buckets,
+                    &failed_buckets,
+                )
+            })
+            .flatten();
         Ok(ScannerCycleResult::new(cycle_status, dirty_usage_clear)
             .with_failed_dirty_usage(!failed_buckets.is_empty())
             .with_pending_maintenance_work(pending_maintenance_work))
@@ -2196,12 +2232,13 @@ mod tests {
     fn scanner_cycle_status_requires_a_clean_complete_snapshot() {
         assert_eq!(classify_nsscanner_cycle(true, false, false, false, true), ScannerCycleStatus::Complete);
 
+        assert_eq!(classify_nsscanner_cycle(true, false, false, false, false), ScannerCycleStatus::Superseded);
+
         for status in [
             classify_nsscanner_cycle(false, false, false, false, true),
             classify_nsscanner_cycle(true, true, false, false, true),
             classify_nsscanner_cycle(true, false, true, false, true),
             classify_nsscanner_cycle(true, false, false, true, true),
-            classify_nsscanner_cycle(true, false, false, false, false),
         ] {
             assert_eq!(status, ScannerCycleStatus::Incomplete);
         }

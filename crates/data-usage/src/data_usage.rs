@@ -145,6 +145,11 @@ pub struct DataUsageInfo {
     /// LastUpdate is the timestamp of when the data usage info was last updated
     pub last_update: Option<SystemTime>,
 
+    /// Scanner cycle that produced this snapshot. This is optional for
+    /// compatibility with snapshots written before cycle identity was stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scanner_cycle: Option<u64>,
+
     /// Objects total count across all buckets
     pub objects_total_count: u64,
     /// Versions total count across all buckets
@@ -160,11 +165,57 @@ pub struct DataUsageInfo {
     pub buckets_count: u64,
     /// Buckets usage info provides following information across all buckets
     pub buckets_usage: HashMap<String, BucketUsageInfo>,
+    /// Whether this snapshot contains an explicit entry for every bucket.
+    #[serde(default)]
+    pub usage_snapshot_complete: bool,
+    /// Whether the snapshot completed without concurrent namespace activity.
+    /// A nonconverged snapshot is observational only and must not authorize
+    /// quota or write-admission decisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_snapshot_converged: Option<bool>,
+    /// Exact authoritative snapshot from which an observational scan began.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_snapshot_authoritative_baseline: Option<DataUsageSnapshotIdentity>,
     /// Deprecated kept here for backward compatibility reasons
     pub bucket_sizes: HashMap<String, u64>,
     /// Per-disk snapshot information when available
     #[serde(default)]
     pub disk_usage_status: Vec<DiskUsageStatus>,
+}
+
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DataUsageSnapshotIdentity {
+    pub last_update: Option<SystemTime>,
+    pub scanner_cycle: Option<u64>,
+}
+
+impl DataUsageInfo {
+    pub fn snapshot_identity(&self) -> DataUsageSnapshotIdentity {
+        DataUsageSnapshotIdentity {
+            last_update: self.last_update,
+            scanner_cycle: self.scanner_cycle,
+        }
+    }
+}
+
+pub fn data_usage_snapshot_is_newer(candidate: &DataUsageInfo, baseline: &DataUsageInfo) -> bool {
+    match (candidate.scanner_cycle, baseline.scanner_cycle) {
+        (Some(candidate), Some(baseline)) => candidate > baseline,
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => match (candidate.last_update, baseline.last_update) {
+            (Some(candidate), Some(baseline)) => candidate > baseline,
+            (Some(_), None) => true,
+            (None, Some(_) | None) => false,
+        },
+    }
+}
+
+pub fn observed_data_usage_is_newer(observed: &DataUsageInfo, authoritative: &DataUsageInfo) -> bool {
+    observed.usage_snapshot_converged == Some(false)
+        && observed.is_complete_bucket_usage_snapshot()
+        && observed.usage_snapshot_authoritative_baseline.as_ref() == Some(&authoritative.snapshot_identity())
+        && data_usage_snapshot_is_newer(observed, authoritative)
 }
 
 /// Metadata describing the status of a disk-level data usage snapshot.
@@ -951,6 +1002,12 @@ impl DataUsageInfo {
         Self::default()
     }
 
+    pub fn is_complete_bucket_usage_snapshot(&self) -> bool {
+        self.usage_snapshot_complete
+            && self.last_update.is_some()
+            && u64::try_from(self.buckets_usage.len()).ok() == Some(self.buckets_count)
+    }
+
     /// Add object metadata to data usage statistics
     pub fn add_object(&mut self, object_path: &str, meta_object: &rustfs_filemeta::MetaObject) {
         // This method is kept for backward compatibility
@@ -1707,5 +1764,28 @@ mod tests {
         assert!(cache.find("bucket/large").is_some_and(|entry| !entry.compacted));
         assert!(cache.find("bucket/large/a").is_some());
         assert!(cache.find("bucket/large/b").is_some());
+    }
+
+    #[test]
+    fn observation_selection_requires_an_exact_authoritative_baseline() {
+        let mut authoritative = DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
+            scanner_cycle: Some(7),
+            usage_snapshot_complete: true,
+            ..Default::default()
+        };
+        let observed = DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(11)),
+            scanner_cycle: Some(8),
+            usage_snapshot_complete: true,
+            usage_snapshot_converged: Some(false),
+            usage_snapshot_authoritative_baseline: Some(authoritative.snapshot_identity()),
+            ..Default::default()
+        };
+
+        assert!(observed_data_usage_is_newer(&observed, &authoritative));
+
+        authoritative.last_update = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(12));
+        assert!(!observed_data_usage_is_newer(&observed, &authoritative));
     }
 }
