@@ -401,6 +401,11 @@ pub struct AccountInfo {
     pub server: BackendInfo,
     pub policy: serde_json::Value, // Use iam/policy::parse to parse the result, to be done by the caller.
     pub buckets: Vec<BucketAccessInfo>,
+    /// Whether the usage values came from a fully converged scanner cycle.
+    /// `false` means a newer structurally complete observation is shown while
+    /// another convergence pass remains pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_snapshot_converged: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]

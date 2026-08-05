@@ -17,7 +17,9 @@ use std::future::Future;
 use std::sync::{Arc, LazyLock, RwLock};
 
 use crate::ScannerObjectIO;
-use crate::data_usage_define::{BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH};
+use crate::data_usage_define::{
+    BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH, DATA_USAGE_OBSERVED_OBJ_NAME_PATH,
+};
 use crate::runtime_config::{
     ScannerRuntimeConfig, ScannerRuntimeConfigSource, refresh_scanner_runtime_config_from_global, scanner_bitrot_cycle,
     scanner_cycle_interval, scanner_runtime_config_changed, scanner_runtime_config_generation, scanner_start_delay,
@@ -44,6 +46,7 @@ use rustfs_config::{
     ENV_SCANNER_CYCLE_MAX_OBJECTS,
 };
 use rustfs_config::{ENV_SCANNER_CYCLE, ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS};
+use rustfs_data_usage::observed_data_usage_is_newer;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
@@ -53,8 +56,8 @@ use tracing::{debug, error, info, instrument, warn};
 use crate::storage_api::scan::{BucketOperations, BucketOptions, NamespaceLocking as _};
 use crate::{
     ECStore, EcstoreError, RUSTFS_META_BUCKET, ScannerLifecycleConfigExt as _, ScannerReplicationConfigExt as _,
-    get_lifecycle_config, get_replication_config, read_config, replace_bucket_usage_memory_from_info, save_config,
-    scanner_is_erasure_sd,
+    get_lifecycle_config, get_replication_config, invalidate_admin_data_usage_snapshot_cache,
+    invalidate_data_usage_snapshot_cache, read_config, replace_bucket_usage_memory_from_info, save_config, scanner_is_erasure_sd,
 };
 
 const LOG_COMPONENT_SCANNER: &str = "scanner";
@@ -68,6 +71,8 @@ const EVENT_SCANNER_BACKGROUND_HEAL_STATE: &str = "scanner_background_heal_state
 const METRIC_SCANNER_LEADER_LOCK_TOTAL: &str = "rustfs_scanner_leader_lock_total";
 const CLEAN_IDLE_MAX_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const CLEAN_IDLE_BACKOFF_FACTOR: u32 = 2;
+const SUPERSEDED_RETRY_BASE_INTERVAL: Duration = Duration::from_secs(60);
+const SUPERSEDED_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const SCANNER_LEADER_LOCK_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const MAINTENANCE_FEATURE_INSPECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAINTENANCE_FEATURE_INSPECTION_RETRY_BASE_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -82,6 +87,8 @@ pub struct ScannerCycleScheduleStatus {
     effective_interval_seconds: u64,
     clean_idle_backoff_enabled: bool,
     clean_idle_backoff_multiplier: u64,
+    superseded_retry_backoff_enabled: bool,
+    superseded_cycles: u32,
 }
 
 impl Default for ScannerCycleScheduleStatus {
@@ -90,6 +97,8 @@ impl Default for ScannerCycleScheduleStatus {
             effective_interval_seconds: 0,
             clean_idle_backoff_enabled: false,
             clean_idle_backoff_multiplier: 1,
+            superseded_retry_backoff_enabled: false,
+            superseded_cycles: 0,
         }
     }
 }
@@ -111,6 +120,8 @@ fn record_scanner_cycle_schedule(
     effective_interval: Duration,
     clean_idle_backoff_enabled: bool,
     clean_idle_backoff_multiplier: u64,
+    superseded_retry_backoff_enabled: bool,
+    superseded_cycles: u32,
 ) {
     let effective_interval_seconds = effective_interval
         .as_secs()
@@ -122,11 +133,13 @@ fn record_scanner_cycle_schedule(
         effective_interval_seconds,
         clean_idle_backoff_enabled,
         clean_idle_backoff_multiplier: clean_idle_backoff_multiplier.max(1),
+        superseded_retry_backoff_enabled,
+        superseded_cycles,
     };
 }
 
 fn reset_scanner_cycle_schedule() {
-    record_scanner_cycle_schedule(Duration::ZERO, false, 1);
+    record_scanner_cycle_schedule(Duration::ZERO, false, 1, false, 0);
 }
 
 /// Returns the base cycle interval.
@@ -233,6 +246,7 @@ pub(crate) enum ScannerCycleOutcome {
     Completed,
     CompletedWithPendingMaintenance,
     Partial,
+    Superseded,
     Failed,
 }
 
@@ -250,6 +264,30 @@ pub(crate) fn scanner_cycle_outcome_with_pending_maintenance(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ScannerCleanIdleBackoff {
     interval_multiplier: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ScannerSupersededBackoff {
+    consecutive_cycles: u32,
+}
+
+impl ScannerSupersededBackoff {
+    fn record_cycle(&mut self, outcome: ScannerCycleOutcome) {
+        if outcome == ScannerCycleOutcome::Superseded {
+            self.consecutive_cycles = self.consecutive_cycles.saturating_add(1);
+        } else {
+            self.consecutive_cycles = 0;
+        }
+    }
+
+    fn retry_interval(self, configured_interval: Duration) -> Option<Duration> {
+        let exponent = self.consecutive_cycles.checked_sub(1)?.min(31);
+        let multiplier = 1u32.checked_shl(exponent).unwrap_or(u32::MAX);
+        let base_interval = configured_interval
+            .max(Duration::from_secs(1))
+            .min(SUPERSEDED_RETRY_BASE_INTERVAL);
+        Some(base_interval.saturating_mul(multiplier).min(SUPERSEDED_RETRY_MAX_INTERVAL))
+    }
 }
 
 impl Default for ScannerCleanIdleBackoff {
@@ -364,9 +402,10 @@ struct ScannerCycleWaitPlan {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ScannerCycleObservedGenerations {
-    dirty_usage: u64,
+    dirty_usage: Option<u64>,
     runtime_config: u64,
     maintenance: u64,
+    defer_cluster_activity: bool,
 }
 
 const LOCAL_SCANNER_ACTIVITY_NODE: &str = "<local>";
@@ -496,7 +535,7 @@ fn scanner_activity_backoff_blocked_after_wake(currently_blocked: bool, wake_rea
 async fn wait_for_next_scanner_cycle<F>(
     ctx: &CancellationToken,
     delay: Duration,
-    dirty_usage_generation_seen: u64,
+    dirty_usage_generation_seen: Option<u64>,
     runtime_config_generation: u64,
     maintenance_generation: u64,
     is_lock_lost: F,
@@ -519,7 +558,7 @@ where
         if scanner_maintenance_generation() != maintenance_generation {
             return ScannerCycleWakeReason::MaintenanceConfig;
         }
-        if dirty_usage_buckets_pending() && dirty_usage_generation() != dirty_usage_generation_seen {
+        if dirty_usage_generation_seen.is_some_and(|seen| dirty_usage_buckets_pending() && dirty_usage_generation() != seen) {
             return ScannerCycleWakeReason::DirtyUsage;
         }
 
@@ -539,7 +578,9 @@ where
                 if scanner_maintenance_generation() != maintenance_generation {
                     return ScannerCycleWakeReason::MaintenanceConfig;
                 }
-                if dirty_usage_buckets_pending() && dirty_usage_generation() != dirty_usage_generation_seen {
+                if dirty_usage_generation_seen
+                    .is_some_and(|seen| dirty_usage_buckets_pending() && dirty_usage_generation() != seen)
+                {
                     return ScannerCycleWakeReason::DirtyUsage;
                 }
             }
@@ -624,9 +665,15 @@ where
         }
         match observation {
             ScannerActivityObservation::Unchanged | ScannerActivityObservation::NotRequired => {}
-            ScannerActivityObservation::Changed => return ScannerCycleWakeReason::ClusterActivity,
+            ScannerActivityObservation::Changed if !generations.defer_cluster_activity => {
+                return ScannerCycleWakeReason::ClusterActivity;
+            }
+            ScannerActivityObservation::Changed => {}
             ScannerActivityObservation::MaintenanceChanged => return ScannerCycleWakeReason::ClusterMaintenance,
-            ScannerActivityObservation::Unverified => return ScannerCycleWakeReason::ClusterActivityUnavailable,
+            ScannerActivityObservation::Unverified if !generations.defer_cluster_activity => {
+                return ScannerCycleWakeReason::ClusterActivityUnavailable;
+            }
+            ScannerActivityObservation::Unverified => {}
         }
     }
 }
@@ -776,6 +823,11 @@ fn data_usage_info_is_cold(info: &DataUsageInfo) -> bool {
     info.last_update.is_none() || (info.buckets_usage.is_empty() && info.bucket_sizes.is_empty())
 }
 
+fn usage_cache_needs_prompt_scan(authoritative: &DataUsageInfo, observed: Option<&DataUsageInfo>) -> bool {
+    data_usage_info_is_cold(authoritative)
+        || observed.is_some_and(|observed| observed_data_usage_is_newer(observed, authoritative))
+}
+
 async fn read_data_usage_config_for_startup(storeapi: &Arc<ECStore>) -> Result<Option<Vec<u8>>, EcstoreError> {
     match read_config(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str()).await {
         Ok(data) => Ok(Some(data)),
@@ -812,7 +864,38 @@ async fn persisted_usage_cache_is_cold_for_startup(storeapi: &Arc<ECStore>) -> b
     };
 
     match serde_json::from_slice::<DataUsageInfo>(&data) {
-        Ok(info) => data_usage_info_is_cold(&info),
+        Ok(info) => match read_config(storeapi.clone(), DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str()).await {
+            Ok(observed) => match serde_json::from_slice::<DataUsageInfo>(&observed) {
+                Ok(observed) => usage_cache_needs_prompt_scan(&info, Some(&observed)),
+                Err(err) => {
+                    warn!(
+                        target: "rustfs::scanner",
+                        event = EVENT_SCANNER_PERSIST_STATE,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_RUNTIME,
+                        path = %DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(),
+                        state = "startup_observed_decode_failed",
+                        error = %err,
+                        "Scanner startup found an invalid observational snapshot"
+                    );
+                    true
+                }
+            },
+            Err(EcstoreError::ConfigNotFound) => data_usage_info_is_cold(&info),
+            Err(err) => {
+                warn!(
+                    target: "rustfs::scanner",
+                    event = EVENT_SCANNER_PERSIST_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    path = %DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(),
+                    state = "startup_observed_inspect_failed",
+                    error = %err,
+                    "Scanner startup could not inspect the observational snapshot"
+                );
+                data_usage_info_is_cold(&info)
+            }
+        },
         Err(err) => {
             warn!(
                 target: "rustfs::scanner",
@@ -1719,6 +1802,22 @@ async fn run_data_scanner_cycle(
                 ScannerCycleOutcome::Failed
             };
         }
+        ScannerCycleOutcome::Superseded => {
+            info!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_CYCLE_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                cycle = cycle_info.current,
+                state = "superseded",
+                "Scanner cycle usage snapshot was superseded by concurrent namespace activity"
+            );
+            return if finalize_partial_scan_cycle(storeapi.clone(), cycle_info).await {
+                ScannerCycleOutcome::Superseded
+            } else {
+                ScannerCycleOutcome::Failed
+            };
+        }
         ScannerCycleOutcome::Completed | ScannerCycleOutcome::CompletedWithPendingMaintenance => {}
     }
     cycle_info.next += 1;
@@ -1846,6 +1945,7 @@ async fn run_data_scanner_with_maintenance_state(
     let mut dirty_usage_generation_seen = dirty_usage_generation();
     let mut runtime_config_generation_seen = scanner_runtime_config_generation();
     let mut clean_idle_backoff = ScannerCleanIdleBackoff::default();
+    let mut superseded_backoff = ScannerSupersededBackoff::default();
     let initial_runtime_config = resolve_scanner_runtime_config();
     if clean_idle_topology_supported
         && scanner_clean_idle_backoff_configured(&initial_runtime_config)
@@ -1903,6 +2003,7 @@ async fn run_data_scanner_with_maintenance_state(
             return Ok(());
         }
         let initial_outcome = run_data_scanner_cycle(&ctx, &storeapi, &mut cycle_info).await;
+        superseded_backoff.record_cycle(initial_outcome);
         dirty_usage_generation_seen = dirty_generation_before_cycle;
         if guard.is_lock_lost() {
             record_scanner_leader_lock_lost("Scanner leader lock lost during the initial cycle").await;
@@ -1984,7 +2085,13 @@ async fn run_data_scanner_with_maintenance_state(
             maintenance_features,
             &runtime_config,
         );
-        let wait_plan = scanner_cycle_wait_plan(&runtime_config, clean_idle_backoff, backoff_enabled, randomized_cycle_delay_for);
+        let mut wait_plan =
+            scanner_cycle_wait_plan(&runtime_config, clean_idle_backoff, backoff_enabled, randomized_cycle_delay_for);
+        let superseded_retry_interval = superseded_backoff.retry_interval(runtime_config.cycle_interval);
+        if let Some(retry_interval) = superseded_retry_interval {
+            wait_plan.effective_interval = retry_interval;
+            wait_plan.delay = randomized_cycle_delay_for(retry_interval).min(retry_interval);
+        }
         let dirty_generation_before_wait = dirty_usage_generation();
         let dirty_usage_pending_before_wait = dirty_usage_buckets_pending();
         let maintenance_generation_before_wait = scanner_maintenance_generation();
@@ -1992,6 +2099,8 @@ async fn run_data_scanner_with_maintenance_state(
             wait_plan.effective_interval,
             backoff_enabled,
             u64::from(clean_idle_backoff.interval_multiplier),
+            superseded_retry_interval.is_some(),
+            superseded_backoff.consecutive_cycles,
         );
         debug!(
             target: "rustfs::scanner",
@@ -2004,6 +2113,8 @@ async fn run_data_scanner_with_maintenance_state(
             scheduled_delay = ?wait_plan.delay,
             interval_multiplier = clean_idle_backoff.interval_multiplier,
             clean_idle_backoff_enabled = backoff_enabled,
+            superseded_retry_backoff_enabled = superseded_retry_interval.is_some(),
+            superseded_cycles = superseded_backoff.consecutive_cycles,
             lifecycle_active = maintenance_features.lifecycle,
             replication_active = maintenance_features.replication,
             feature_inspection_failed = maintenance_features.inspection_failed,
@@ -2018,9 +2129,10 @@ async fn run_data_scanner_with_maintenance_state(
             activity_poll_interval,
             &mut scanner_activity_seen,
             ScannerCycleObservedGenerations {
-                dirty_usage: dirty_usage_generation_seen,
+                dirty_usage: superseded_retry_interval.is_none().then_some(dirty_usage_generation_seen),
                 runtime_config: runtime_config_generation_seen,
                 maintenance: maintenance_generation_before_wait,
+                defer_cluster_activity: superseded_retry_interval.is_some(),
             },
             || guard.is_lock_lost(),
             || probe_scanner_activity(&storeapi, distributed),
@@ -2090,6 +2202,7 @@ async fn run_data_scanner_with_maintenance_state(
         }
         let dirty_generation_before_cycle = dirty_usage_generation();
         let outcome = run_data_scanner_cycle(&ctx, &storeapi, &mut cycle_info).await;
+        superseded_backoff.record_cycle(outcome);
         dirty_usage_generation_seen = dirty_generation_before_cycle;
         if guard.is_lock_lost() {
             record_scanner_leader_lock_lost("Scanner leader lock lost during a scanner cycle").await;
@@ -2251,6 +2364,8 @@ fn scanner_cycle_completion_outcome(
 ) -> ScannerCycleOutcome {
     match (scan_status, usage_persist_outcome) {
         (_, DataUsagePersistOutcome::Failed) => ScannerCycleOutcome::Failed,
+        (ScannerCycleStatus::Superseded, _) if !has_failed_dirty_usage => ScannerCycleOutcome::Superseded,
+        (ScannerCycleStatus::Superseded, _) => ScannerCycleOutcome::Failed,
         (ScannerCycleStatus::Incomplete, DataUsagePersistOutcome::Saved) if !has_failed_dirty_usage => {
             ScannerCycleOutcome::Partial
         }
@@ -2272,7 +2387,7 @@ fn finalize_scanner_cycle_result(
         scan_cycle_result.has_failed_dirty_usage(),
     );
     let pending_maintenance_work = scan_cycle_result.has_pending_maintenance_work();
-    if usage_persist_outcome == DataUsagePersistOutcome::Saved {
+    if scan_cycle_result.status == ScannerCycleStatus::Complete && usage_persist_outcome == DataUsagePersistOutcome::Saved {
         scan_cycle_result.acknowledge_durable_usage();
     }
     (completion_outcome, pending_maintenance_work)
@@ -2320,13 +2435,73 @@ async fn store_data_usage_in_backend_with_outcome(
     let mut attempts = 1u32;
     let mut outcome = DataUsagePersistOutcome::NoUpdate;
 
-    while let Some(data_usage_info) = receiver.recv().await {
+    while let Some(mut data_usage_info) = receiver.recv().await {
         let _activity_guard = ScannerActivityGuard::new();
         if ctx.is_cancelled() {
             break;
         }
 
-        if let Ok(buf) = read_config(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str()).await
+        let observational = data_usage_info.usage_snapshot_converged == Some(false);
+        let target_path = if observational {
+            DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str()
+        } else {
+            DATA_USAGE_OBJ_NAME_PATH.as_str()
+        };
+
+        if observational && data_usage_info.usage_snapshot_authoritative_baseline.is_none() {
+            let authoritative = match read_config(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str()).await {
+                Ok(data) => match serde_json::from_slice::<DataUsageInfo>(&data) {
+                    Ok(info) => info,
+                    Err(err) => {
+                        error!(
+                            target: "rustfs::scanner",
+                            event = EVENT_SCANNER_PERSIST_STATE,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_RUNTIME,
+                            path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
+                            state = "observed_baseline_decode_failed",
+                            error = %err,
+                            "Scanner refused to publish an observation from an invalid authoritative baseline"
+                        );
+                        outcome = DataUsagePersistOutcome::Failed;
+                        continue;
+                    }
+                },
+                Err(EcstoreError::ConfigNotFound) => DataUsageInfo::default(),
+                Err(err) => {
+                    error!(
+                        target: "rustfs::scanner",
+                        event = EVENT_SCANNER_PERSIST_STATE,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_RUNTIME,
+                        path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
+                        state = "observed_baseline_load_failed",
+                        error = %err,
+                        "Scanner could not identify the authoritative baseline for an observation"
+                    );
+                    outcome = DataUsagePersistOutcome::Failed;
+                    continue;
+                }
+            };
+            data_usage_info.usage_snapshot_authoritative_baseline = Some(authoritative.snapshot_identity());
+        }
+
+        if observational && !data_usage_info.is_complete_bucket_usage_snapshot() {
+            error!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                path = %target_path,
+                state = "reject_incomplete_snapshot",
+                "Scanner refused to persist an incomplete data usage snapshot"
+            );
+            global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Failed);
+            outcome = DataUsagePersistOutcome::Failed;
+            continue;
+        }
+
+        if let Ok(buf) = read_config(storeapi.clone(), target_path).await
             && let Ok(existing) = serde_json::from_slice::<DataUsageInfo>(&buf)
             && let Some(reason) = stale_data_usage_update_reason(&data_usage_info, &existing, std::time::SystemTime::now())
         {
@@ -2335,7 +2510,7 @@ async fn store_data_usage_in_backend_with_outcome(
                 event = EVENT_SCANNER_PERSIST_STATE,
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_RUNTIME,
-                path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
+                path = %target_path,
                 incoming_last_update = ?data_usage_info.last_update,
                 existing_last_update = ?existing.last_update,
                 reason = reason,
@@ -2355,7 +2530,7 @@ async fn store_data_usage_in_backend_with_outcome(
                     event = EVENT_SCANNER_PERSIST_STATE,
                     component = LOG_COMPONENT_SCANNER,
                     subsystem = LOG_SUBSYSTEM_RUNTIME,
-                    path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
+                    path = %target_path,
                     state = "encode_failed",
                     error = %e,
                     "Scanner data usage encode failed"
@@ -2365,10 +2540,10 @@ async fn store_data_usage_in_backend_with_outcome(
                 continue;
             }
         };
-        let backup_data = (attempts > 10).then(|| data.clone());
+        let backup_data = (!observational && attempts > 10).then(|| data.clone());
 
         let done_save = Metrics::time(Metric::SaveUsage);
-        let save_result = save_config(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), data).await;
+        let save_result = save_config(storeapi.clone(), target_path, data).await;
         done_save();
 
         if let Err(e) = save_result {
@@ -2377,7 +2552,7 @@ async fn store_data_usage_in_backend_with_outcome(
                 event = EVENT_SCANNER_PERSIST_STATE,
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_RUNTIME,
-                path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
+                path = %target_path,
                 state = "save_failed",
                 error = %e,
                 "Scanner data usage save failed"
@@ -2385,7 +2560,12 @@ async fn store_data_usage_in_backend_with_outcome(
             global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Failed);
             outcome = DataUsagePersistOutcome::Failed;
         } else {
-            replace_bucket_usage_memory_from_info(&data_usage_info).await;
+            if observational {
+                invalidate_admin_data_usage_snapshot_cache().await;
+            } else {
+                invalidate_data_usage_snapshot_cache().await;
+                replace_bucket_usage_memory_from_info(&data_usage_info).await;
+            }
             global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Success);
             outcome = DataUsagePersistOutcome::Saved;
 
@@ -2852,6 +3032,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_store_data_usage_in_backend_keeps_observation_out_of_authoritative_path() {
+        let store = Arc::new(MemoryConfigStore::default());
+        let authoritative_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+        let authoritative = DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH),
+            scanner_cycle: Some(10),
+            usage_snapshot_complete: true,
+            usage_snapshot_converged: Some(true),
+            ..Default::default()
+        };
+        let authoritative_bytes = serde_json::to_vec(&authoritative).expect("authoritative usage should encode");
+        store
+            .objects
+            .lock()
+            .await
+            .insert(authoritative_key.clone(), authoritative_bytes.clone());
+
+        let (sender, receiver) = mpsc::channel(1);
+        sender
+            .send(DataUsageInfo {
+                last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+                scanner_cycle: Some(11),
+                usage_snapshot_complete: true,
+                usage_snapshot_converged: Some(false),
+                ..Default::default()
+            })
+            .await
+            .expect("observation should enqueue");
+        drop(sender);
+
+        let outcome = store_data_usage_in_backend_with_outcome(CancellationToken::new(), store.clone(), receiver).await;
+        let objects = store.objects.lock().await;
+        let observed = objects
+            .get(&memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str()))
+            .expect("observation should persist");
+        let observed = serde_json::from_slice::<DataUsageInfo>(observed).expect("observation should decode");
+
+        assert_eq!(outcome, DataUsagePersistOutcome::Saved);
+        assert_eq!(observed.usage_snapshot_converged, Some(false));
+        assert_eq!(observed.usage_snapshot_authoritative_baseline, Some(authoritative.snapshot_identity()));
+        assert_eq!(objects.get(&authoritative_key), Some(&authoritative_bytes));
+    }
+
+    #[tokio::test]
     async fn test_store_data_usage_in_backend_rejects_untimestamped_stale_snapshot() {
         let store = Arc::new(MemoryConfigStore::default());
         let (sender, receiver) = mpsc::channel(2);
@@ -3050,6 +3274,14 @@ mod tests {
             scanner_cycle_completion_outcome(ScannerCycleStatus::Complete, DataUsagePersistOutcome::NoUpdate, false, false),
             ScannerCycleOutcome::Failed
         );
+        assert_eq!(
+            scanner_cycle_completion_outcome(ScannerCycleStatus::Superseded, DataUsagePersistOutcome::Saved, true, false),
+            ScannerCycleOutcome::Superseded
+        );
+        assert_eq!(
+            scanner_cycle_completion_outcome(ScannerCycleStatus::Superseded, DataUsagePersistOutcome::Saved, true, true),
+            ScannerCycleOutcome::Failed
+        );
     }
 
     #[test]
@@ -3068,6 +3300,21 @@ mod tests {
         let (outcome, _) = finalize_scanner_cycle_result(saved, DataUsagePersistOutcome::Saved);
         assert_eq!(outcome, ScannerCycleOutcome::Completed);
         assert!(!crate::scanner_io::dirty_usage_buckets_pending());
+    }
+
+    #[test]
+    #[serial]
+    fn finalizing_a_saved_observation_keeps_dirty_work_pending() {
+        crate::scanner_io::clear_dirty_usage_bucket("photos");
+        crate::scanner_io::record_dirty_usage_bucket("photos");
+        let dirty_snapshot = crate::scanner_io::dirty_usage_buckets_for_tests();
+
+        let superseded = crate::scanner_io::ScannerCycleResult::new(ScannerCycleStatus::Superseded, Some(dirty_snapshot));
+        let (outcome, _) = finalize_scanner_cycle_result(superseded, DataUsagePersistOutcome::Saved);
+
+        assert_eq!(outcome, ScannerCycleOutcome::Superseded);
+        assert!(crate::scanner_io::dirty_usage_buckets_pending());
+        crate::scanner_io::clear_dirty_usage_bucket("photos");
     }
 
     #[tokio::test]
@@ -3359,19 +3606,37 @@ mod tests {
     #[test]
     #[serial]
     fn scanner_cycle_schedule_status_reports_effective_backoff() {
-        record_scanner_cycle_schedule(Duration::from_millis(86_400_001), true, 2_048);
+        record_scanner_cycle_schedule(Duration::from_millis(86_400_001), true, 2_048, true, 7);
 
         let status = scanner_cycle_schedule_status();
 
         assert_eq!(status.effective_interval_seconds, 86_401);
         assert!(status.clean_idle_backoff_enabled);
         assert_eq!(status.clean_idle_backoff_multiplier, 2_048);
+        assert!(status.superseded_retry_backoff_enabled);
+        assert_eq!(status.superseded_cycles, 7);
 
         reset_scanner_cycle_schedule();
         let status = scanner_cycle_schedule_status();
         assert_eq!(status.effective_interval_seconds, 0);
         assert!(!status.clean_idle_backoff_enabled);
         assert_eq!(status.clean_idle_backoff_multiplier, 1);
+        assert!(!status.superseded_retry_backoff_enabled);
+        assert_eq!(status.superseded_cycles, 0);
+    }
+
+    #[test]
+    fn superseded_retry_backoff_grows_caps_and_resets() {
+        let mut backoff = ScannerSupersededBackoff::default();
+        assert_eq!(backoff.retry_interval(Duration::from_secs(60)), None);
+
+        for expected in [60, 120, 240, 480, 960, 1_800, 1_800] {
+            backoff.record_cycle(ScannerCycleOutcome::Superseded);
+            assert_eq!(backoff.retry_interval(Duration::from_secs(60)), Some(Duration::from_secs(expected)));
+        }
+
+        backoff.record_cycle(ScannerCycleOutcome::Completed);
+        assert_eq!(backoff.retry_interval(Duration::from_secs(60)), None);
     }
 
     #[test]
@@ -3762,7 +4027,7 @@ mod tests {
         let mut wait = Box::pin(wait_for_next_scanner_cycle(
             &ctx,
             Duration::from_secs(60),
-            dirty_generation,
+            Some(dirty_generation),
             crate::runtime_config::scanner_runtime_config_generation(),
             crate::scanner_io::scanner_maintenance_generation(),
             || false,
@@ -3789,7 +4054,7 @@ mod tests {
         let reason = wait_for_next_scanner_cycle(
             &ctx,
             Duration::from_secs(60),
-            dirty_generation,
+            Some(dirty_generation),
             crate::runtime_config::scanner_runtime_config_generation(),
             crate::scanner_io::scanner_maintenance_generation(),
             || false,
@@ -3810,7 +4075,7 @@ mod tests {
         let wait = wait_for_next_scanner_cycle(
             &ctx,
             Duration::from_secs(60),
-            dirty_generation,
+            Some(dirty_generation),
             crate::runtime_config::scanner_runtime_config_generation(),
             crate::scanner_io::scanner_maintenance_generation(),
             || false,
@@ -3819,6 +4084,25 @@ mod tests {
         let reason = wait.await;
 
         assert_eq!(reason, ScannerCycleWakeReason::Timer);
+        crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn test_wait_for_next_scanner_cycle_can_defer_dirty_wakes_until_timer() {
+        crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+        let ctx = CancellationToken::new();
+        let wait = wait_for_next_scanner_cycle(
+            &ctx,
+            Duration::from_secs(60),
+            None,
+            crate::runtime_config::scanner_runtime_config_generation(),
+            crate::scanner_io::scanner_maintenance_generation(),
+            || false,
+        );
+
+        crate::scanner_io::record_dirty_usage_bucket("photos");
+        assert_eq!(wait.await, ScannerCycleWakeReason::Timer);
         crate::scanner_io::clear_dirty_usage_buckets_for_tests();
     }
 
@@ -3832,7 +4116,7 @@ mod tests {
         let mut wait = Box::pin(wait_for_next_scanner_cycle(
             &ctx,
             Duration::from_secs(60),
-            dirty_generation,
+            Some(dirty_generation),
             crate::runtime_config::scanner_runtime_config_generation(),
             crate::scanner_io::scanner_maintenance_generation(),
             || false,
@@ -3857,7 +4141,7 @@ mod tests {
         let mut wait = Box::pin(wait_for_next_scanner_cycle(
             &ctx,
             Duration::from_secs(60),
-            crate::scanner_io::dirty_usage_generation(),
+            Some(crate::scanner_io::dirty_usage_generation()),
             observed_generation,
             crate::scanner_io::scanner_maintenance_generation(),
             || false,
@@ -3885,7 +4169,7 @@ mod tests {
         let mut wait = Box::pin(wait_for_next_scanner_cycle(
             &ctx,
             Duration::from_secs(60),
-            crate::scanner_io::dirty_usage_generation(),
+            Some(crate::scanner_io::dirty_usage_generation()),
             crate::runtime_config::scanner_runtime_config_generation(),
             observed_generation,
             || false,
@@ -3907,7 +4191,7 @@ mod tests {
         let reason = wait_for_next_scanner_cycle(
             &ctx,
             Duration::from_secs(60),
-            crate::scanner_io::dirty_usage_generation(),
+            Some(crate::scanner_io::dirty_usage_generation()),
             crate::runtime_config::scanner_runtime_config_generation(),
             crate::scanner_io::scanner_maintenance_generation(),
             || true,
@@ -4029,9 +4313,10 @@ mod tests {
             Some(Duration::from_secs(60)),
             &mut seen,
             ScannerCycleObservedGenerations {
-                dirty_usage: crate::scanner_io::dirty_usage_generation(),
+                dirty_usage: Some(crate::scanner_io::dirty_usage_generation()),
                 runtime_config: crate::runtime_config::scanner_runtime_config_generation(),
                 maintenance: crate::scanner_io::scanner_maintenance_generation(),
+                defer_cluster_activity: false,
             },
             || false,
             || std::future::ready(Ok(changed.clone())),
@@ -4039,6 +4324,34 @@ mod tests {
         .await;
 
         assert_eq!(reason, ScannerCycleWakeReason::ClusterActivity);
+        assert_eq!(seen, Some(changed));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn superseded_retry_wait_defers_dirty_cluster_activity_until_timer() {
+        crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+        let ctx = CancellationToken::new();
+        let mut seen = Some(BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]));
+        let changed = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 8, 3))]);
+
+        let reason = wait_for_next_scanner_cycle_with_activity(
+            &ctx,
+            Duration::from_secs(120),
+            Some(Duration::from_secs(60)),
+            &mut seen,
+            ScannerCycleObservedGenerations {
+                dirty_usage: None,
+                runtime_config: crate::runtime_config::scanner_runtime_config_generation(),
+                maintenance: crate::scanner_io::scanner_maintenance_generation(),
+                defer_cluster_activity: true,
+            },
+            || false,
+            || std::future::ready(Ok(changed.clone())),
+        )
+        .await;
+
+        assert_eq!(reason, ScannerCycleWakeReason::Timer);
         assert_eq!(seen, Some(changed));
     }
 
@@ -4056,9 +4369,10 @@ mod tests {
             Some(Duration::from_secs(60)),
             &mut seen,
             ScannerCycleObservedGenerations {
-                dirty_usage: crate::scanner_io::dirty_usage_generation(),
+                dirty_usage: Some(crate::scanner_io::dirty_usage_generation()),
                 runtime_config: crate::runtime_config::scanner_runtime_config_generation(),
                 maintenance: crate::scanner_io::scanner_maintenance_generation(),
+                defer_cluster_activity: false,
             },
             || false,
             || std::future::ready(Ok(changed.clone())),
@@ -4081,9 +4395,10 @@ mod tests {
             Some(Duration::from_secs(60)),
             &mut seen,
             ScannerCycleObservedGenerations {
-                dirty_usage: crate::scanner_io::dirty_usage_generation(),
+                dirty_usage: Some(crate::scanner_io::dirty_usage_generation()),
                 runtime_config: crate::runtime_config::scanner_runtime_config_generation(),
                 maintenance: crate::scanner_io::scanner_maintenance_generation(),
+                defer_cluster_activity: false,
             },
             || false,
             || std::future::ready(Err("node-2 is unreachable".to_string())),
@@ -4108,9 +4423,10 @@ mod tests {
             Some(Duration::from_secs(60)),
             &mut seen,
             ScannerCycleObservedGenerations {
-                dirty_usage: crate::scanner_io::dirty_usage_generation(),
+                dirty_usage: Some(crate::scanner_io::dirty_usage_generation()),
                 runtime_config: crate::runtime_config::scanner_runtime_config_generation(),
                 maintenance: crate::scanner_io::scanner_maintenance_generation(),
+                defer_cluster_activity: false,
             },
             || false,
             || std::future::ready(Ok(expected.clone())),
@@ -4139,9 +4455,10 @@ mod tests {
             Some(Duration::from_secs(60)),
             &mut seen,
             ScannerCycleObservedGenerations {
-                dirty_usage: crate::scanner_io::dirty_usage_generation(),
+                dirty_usage: Some(crate::scanner_io::dirty_usage_generation()),
                 runtime_config: crate::runtime_config::scanner_runtime_config_generation(),
                 maintenance: crate::scanner_io::scanner_maintenance_generation(),
+                defer_cluster_activity: false,
             },
             || false,
             std::future::pending::<Result<ScannerActivitySnapshot, String>>,
@@ -4170,9 +4487,10 @@ mod tests {
             Some(Duration::from_secs(60)),
             &mut seen,
             ScannerCycleObservedGenerations {
-                dirty_usage: crate::scanner_io::dirty_usage_generation(),
+                dirty_usage: Some(crate::scanner_io::dirty_usage_generation()),
                 runtime_config: crate::runtime_config::scanner_runtime_config_generation(),
                 maintenance: crate::scanner_io::scanner_maintenance_generation(),
+                defer_cluster_activity: false,
             },
             || lock_lost.load(std::sync::atomic::Ordering::Acquire),
             std::future::pending::<Result<ScannerActivitySnapshot, String>>,

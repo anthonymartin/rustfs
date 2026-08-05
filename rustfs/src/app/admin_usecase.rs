@@ -19,7 +19,9 @@ use super::storage_api::admin_usecase::capacity::{
     PoolDecommissionInfo, PoolStatus, RebalStatus, get_total_usable_capacity, get_total_usable_capacity_free,
 };
 use super::storage_api::admin_usecase::contract::StorageAdminApi;
-use super::storage_api::admin_usecase::data_usage::{apply_bucket_usage_memory_overlay, load_data_usage_from_backend_cached};
+use super::storage_api::admin_usecase::data_usage::{
+    apply_bucket_usage_memory_overlay, load_admin_data_usage_from_backend_cached,
+};
 use super::storage_api::admin_usecase::{ECStore, EndpointServerPools};
 use crate::app::runtime_sources::{
     AppContext, current_app_context, current_endpoints_handle, current_object_store_handle_for_context,
@@ -251,7 +253,7 @@ impl DefaultAdminUsecase {
     /// This request path must never trigger a live full-version listing
     /// (rustfs/backlog#1306); freshness is owned by the scanner.
     pub(crate) async fn query_data_usage_info_with_store(store: Arc<ECStore>) -> AdminUsecaseResult<DataUsageInfo> {
-        let mut info = Self::map_data_usage_load_result(load_data_usage_from_backend_cached(store.clone()).await)?;
+        let mut info = Self::map_data_usage_load_result(load_admin_data_usage_from_backend_cached(store.clone()).await)?;
         apply_bucket_usage_memory_overlay(&mut info).await;
 
         let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;

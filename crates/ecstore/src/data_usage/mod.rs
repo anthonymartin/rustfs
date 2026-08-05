@@ -34,7 +34,7 @@ use crate::{
 pub use local_snapshot::{LocalUsageSnapshot, read_snapshot as read_local_snapshot, snapshot_path};
 use rustfs_data_usage::{
     BucketTargetUsageInfo, BucketUsageInfo, CompressionTotalInfo, DataUsageCache, DataUsageEntry, DataUsageInfo, DiskUsageStatus,
-    SizeHistogram, SizeSummary, VersionsHistogram,
+    SizeHistogram, SizeSummary, VersionsHistogram, observed_data_usage_is_newer,
 };
 use rustfs_io_metrics::record_system_path_failure;
 use rustfs_utils::path::SLASH_SEPARATOR;
@@ -54,6 +54,7 @@ use tracing::{debug, error, info, instrument};
 // Data usage storage constants
 pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR;
 const DATA_USAGE_OBJ_NAME: &str = ".usage.json";
+const DATA_USAGE_OBSERVED_OBJ_NAME: &str = ".usage.observed.json";
 const DATA_COMPRESSION_TOTAL_NAME: &str = ".compression.json";
 const DATA_USAGE_BLOOM_NAME: &str = ".bloomcycle.bin";
 pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
@@ -129,6 +130,7 @@ fn cache_data_usage_snapshot_result(
 type DataUsageSnapshotCache = Arc<RwLock<Option<CachedDataUsageSnapshot>>>;
 
 static DATA_USAGE_SNAPSHOT_CACHE: OnceLock<DataUsageSnapshotCache> = OnceLock::new();
+static ADMIN_DATA_USAGE_SNAPSHOT_CACHE: OnceLock<DataUsageSnapshotCache> = OnceLock::new();
 
 // Always-on revert detector for rustfs/backlog#1306: one relaxed increment per
 // full-bucket version listing is negligible and lets tests prove that admin
@@ -183,6 +185,10 @@ fn data_usage_snapshot_cache() -> &'static DataUsageSnapshotCache {
     DATA_USAGE_SNAPSHOT_CACHE.get_or_init(|| Arc::new(RwLock::new(None)))
 }
 
+fn admin_data_usage_snapshot_cache() -> &'static DataUsageSnapshotCache {
+    ADMIN_DATA_USAGE_SNAPSHOT_CACHE.get_or_init(|| Arc::new(RwLock::new(None)))
+}
+
 fn live_bucket_usage_cache() -> &'static LiveBucketUsageCache {
     LIVE_BUCKET_USAGE_CACHE.get_or_init(|| {
         moka::future::Cache::builder()
@@ -202,6 +208,11 @@ lazy_static::lazy_static! {
         crate::disk::BUCKET_META_PREFIX,
         SLASH_SEPARATOR,
         DATA_USAGE_OBJ_NAME
+    );
+    pub static ref DATA_USAGE_OBSERVED_OBJ_NAME_PATH: String = format!("{}{}{}",
+        crate::disk::BUCKET_META_PREFIX,
+        SLASH_SEPARATOR,
+        DATA_USAGE_OBSERVED_OBJ_NAME
     );
     static ref DATA_USAGE_OBJ_BACKUP_PATH: String = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
     pub static ref DATA_USAGE_BLOOM_NAME_PATH: String = format!("{}{}{}",
@@ -259,6 +270,12 @@ fn stale_data_usage_persist_reason_for_source(
 /// Store data usage info to backend storage
 #[instrument(skip(store))]
 pub async fn store_data_usage_in_backend(data_usage_info: DataUsageInfo, store: Arc<ECStore>) -> Result<(), Error> {
+    if data_usage_info.usage_snapshot_converged == Some(false) {
+        return Err(Error::other(
+            "nonconverged data usage observations cannot replace the quota-authoritative snapshot",
+        ));
+    }
+
     // Prevent older data from overwriting newer persisted stats
     if let Ok((existing, source)) = load_data_usage_snapshot(store.clone()).await
         && let Some(reason) = stale_data_usage_persist_reason_for_source(&data_usage_info, &existing, source, SystemTime::now())
@@ -287,6 +304,7 @@ async fn save_data_usage_in_backend(data_usage_info: DataUsageInfo, store: Arc<E
     // read reloads through `load_data_usage_from_backend`, keeping its
     // backward-compatibility post-processing.
     *data_usage_snapshot_cache().write().await = None;
+    *admin_data_usage_snapshot_cache().write().await = None;
 
     Ok(())
 }
@@ -319,6 +337,13 @@ fn merge_bucket_usage_removal(candidate: DataUsageInfo, existing: Option<DataUsa
     };
 
     if remove_bucket_usage_from_info(&mut data_usage_info, bucket) {
+        let now = SystemTime::now();
+        data_usage_info.last_update = Some(
+            data_usage_info
+                .last_update
+                .and_then(|last_update| last_update.checked_add(Duration::from_nanos(1)))
+                .map_or(now, |next_update| now.max(next_update)),
+        );
         Some(data_usage_info)
     } else {
         None
@@ -542,6 +567,84 @@ pub async fn load_data_usage_from_backend_cached(store: Arc<ECStore>) -> Result<
 
     let result = load_data_usage_from_backend(store).await;
     cache_data_usage_snapshot_result(&mut cache, result, tokio::time::Instant::now())
+}
+
+async fn load_observed_data_usage_snapshot(store: Arc<ECStore>) -> Option<DataUsageInfo> {
+    let data = match read_config_preserve_empty(store, &DATA_USAGE_OBSERVED_OBJ_NAME_PATH).await {
+        Ok(data) => data,
+        Err(Error::ConfigNotFound) => return None,
+        Err(err) => {
+            record_usage_snapshot_failure("read_observed", DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(), &err);
+            return None;
+        }
+    };
+
+    match parse_usage_snapshot(&data) {
+        Ok(info) if info.usage_snapshot_converged == Some(false) && info.is_complete_bucket_usage_snapshot() => Some(info),
+        Ok(_) => {
+            error!(
+                event = "data_usage_snapshot_load_failed",
+                component = "ecstore",
+                subsystem = "data_usage",
+                state = "invalid_observed_snapshot",
+                object = %DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(),
+                "observed data usage snapshot was not a structurally complete nonconverged view"
+            );
+            None
+        }
+        Err(err) => {
+            record_usage_snapshot_decode_failure("parse_observed", DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(), &err);
+            None
+        }
+    }
+}
+
+fn select_admin_data_usage_snapshot(mut authoritative: DataUsageInfo, observed: Option<DataUsageInfo>) -> DataUsageInfo {
+    if authoritative.last_update.is_some()
+        && u64::try_from(authoritative.buckets_usage.len()).ok() == Some(authoritative.buckets_count)
+    {
+        authoritative.usage_snapshot_complete = true;
+        authoritative.usage_snapshot_converged = Some(true);
+    }
+
+    match observed {
+        Some(observed) if observed_data_usage_is_newer(&observed, &authoritative) => observed,
+        _ => authoritative,
+    }
+}
+
+async fn load_admin_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
+    let authoritative = normalize_loaded_data_usage(load_data_usage_snapshot(store.clone()).await?.0).await;
+    let observed = load_observed_data_usage_snapshot(store).await;
+    Ok(normalize_loaded_data_usage(select_admin_data_usage_snapshot(authoritative, observed)).await)
+}
+
+pub async fn load_admin_data_usage_from_backend_cached(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
+    let ttl = Duration::from_secs(DATA_USAGE_CACHE_TTL_SECS);
+
+    {
+        let cache = admin_data_usage_snapshot_cache().read().await;
+        if let Some(result) = fresh_cached_data_usage_snapshot(&cache, tokio::time::Instant::now(), ttl) {
+            return result;
+        }
+    }
+
+    let mut cache = admin_data_usage_snapshot_cache().write().await;
+    if let Some(result) = fresh_cached_data_usage_snapshot(&cache, tokio::time::Instant::now(), ttl) {
+        return result;
+    }
+
+    let result = load_admin_data_usage_from_backend(store).await;
+    cache_data_usage_snapshot_result(&mut cache, result, tokio::time::Instant::now())
+}
+
+pub async fn invalidate_data_usage_snapshot_cache() {
+    *data_usage_snapshot_cache().write().await = None;
+    *admin_data_usage_snapshot_cache().write().await = None;
+}
+
+pub async fn invalidate_admin_data_usage_snapshot_cache() {
+    *admin_data_usage_snapshot_cache().write().await = None;
 }
 
 /// Aggregate usage information from local disk snapshots.
@@ -1597,6 +1700,28 @@ mod tests {
     }
 
     #[test]
+    fn admin_snapshot_selection_is_observational_and_baseline_fenced() {
+        let mut authoritative = data_usage_info_for_test("bucket", 1, 42, SystemTime::UNIX_EPOCH);
+        authoritative.scanner_cycle = Some(10);
+        authoritative.usage_snapshot_complete = true;
+        let observed = DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+            scanner_cycle: Some(11),
+            usage_snapshot_complete: true,
+            usage_snapshot_converged: Some(false),
+            usage_snapshot_authoritative_baseline: Some(authoritative.snapshot_identity()),
+            ..authoritative.clone()
+        };
+
+        let selected = select_admin_data_usage_snapshot(authoritative.clone(), Some(observed.clone()));
+        assert_eq!(selected.usage_snapshot_converged, Some(false));
+
+        authoritative.last_update = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(2));
+        let selected = select_admin_data_usage_snapshot(authoritative, Some(observed));
+        assert_eq!(selected.usage_snapshot_converged, Some(true));
+    }
+
+    #[test]
     fn stale_data_usage_persist_reason_allows_newer_incoming() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let incoming = usage_with_last_update(Some(now));
@@ -2205,7 +2330,7 @@ mod tests {
         let merged = merge_bucket_usage_removal(candidate, Some(existing), "bucket-a")
             .expect("bucket-a should be removed from the current snapshot");
 
-        assert_eq!(merged.last_update, Some(now));
+        assert!(merged.last_update.is_some_and(|last_update| last_update > now));
         assert_eq!(merged.buckets_count, 1);
         assert_eq!(merged.objects_total_count, 5);
         assert_eq!(merged.objects_total_size, 210);
