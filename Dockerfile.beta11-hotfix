@@ -61,10 +61,10 @@ ARG VCS_REF
 
 COPY --from=builder /usr/local/bin/rustfs-hotfix /usr/bin/rustfs
 
-LABEL org.opencontainers.image.title="RustFS beta.11 heal hotfix" \
-      org.opencontainers.image.description="RustFS 1.0.0-beta.11 with bounded heal observability" \
-      org.opencontainers.image.version="1.0.0-beta.11-heal-hotfix" \
+LABEL org.opencontainers.image.title="RustFS beta.11 Lone Pine hotfix" \
+      org.opencontainers.image.description="RustFS 1.0.0-beta.11 with bounded heal observability and scanner freshness" \
+      org.opencontainers.image.version="1.0.0-beta.11-lonepine-hotfix" \
       org.opencontainers.image.revision="$VCS_REF" \
       org.opencontainers.image.created="$BUILD_DATE" \
-      org.opencontainers.image.source="https://github.com/anthonymartin/rustfs/tree/agent/beta11-bound-heal-observability" \
+      org.opencontainers.image.source="https://github.com/anthonymartin/rustfs" \
       org.opencontainers.image.base.name="docker.io/rustfs/rustfs:1.0.0-beta.11@sha256:84ce557a0245a06a9aae5516f55ee0f007fca78d41df356f419306fdc0cb168c"
