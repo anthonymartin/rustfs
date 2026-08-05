@@ -49,11 +49,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/usr/src/rustfs/target/hotfix-build \
-    cargo build --locked --release --target x86_64-unknown-linux-musl -p rustfs --bin rustfs
-
-RUN install -m 0755 \
-    /usr/src/rustfs/target/hotfix-build/x86_64-unknown-linux-musl/release/rustfs \
-    /usr/local/bin/rustfs-hotfix
+    cargo build --locked --release --target x86_64-unknown-linux-musl -p rustfs --bin rustfs && \
+    install -m 0755 \
+      /usr/src/rustfs/target/hotfix-build/x86_64-unknown-linux-musl/release/rustfs \
+      /usr/local/bin/rustfs-hotfix
 
 FROM $RUSTFS_BASE_IMAGE
 
