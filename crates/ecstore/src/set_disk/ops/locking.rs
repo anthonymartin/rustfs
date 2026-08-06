@@ -28,7 +28,7 @@ impl crate::storage_api_contracts::namespace::NamespaceLocking for SetDisks {
     type Error = Error;
     type NamespaceLock = NamespaceLockWrapper;
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
         let set_lock = if runtime_sources::setup_is_dist_erasure().await {
             // Calculate quorum based on lockers count (majority)

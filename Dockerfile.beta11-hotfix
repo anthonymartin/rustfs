@@ -62,7 +62,7 @@ ARG VCS_REF
 COPY --from=builder /usr/local/bin/rustfs-hotfix /usr/bin/rustfs
 
 LABEL org.opencontainers.image.title="RustFS beta.11 Lone Pine hotfix" \
-      org.opencontainers.image.description="RustFS 1.0.0-beta.11 with bounded heal observability and scanner freshness" \
+      org.opencontainers.image.description="RustFS 1.0.0-beta.11 with bounded heal and namespace-lock observability plus scanner freshness" \
       org.opencontainers.image.version="1.0.0-beta.11-lonepine-hotfix" \
       org.opencontainers.image.revision="$VCS_REF" \
       org.opencontainers.image.created="$BUILD_DATE" \
