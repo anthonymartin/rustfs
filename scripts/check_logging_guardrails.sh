@@ -44,6 +44,7 @@ checked_files=(
   "crates/ecstore/src/store/peer.rs"
   "crates/ecstore/src/store/init.rs"
   "crates/ecstore/src/client/transition_api.rs"
+  "crates/ecstore/src/set_disk/ops/locking.rs"
   "crates/ecstore/src/services/tier/tier.rs"
   "crates/heal/src/heal/manager.rs"
   "crates/heal/src/heal/storage.rs"
@@ -672,6 +673,21 @@ trace_heal_instrumentation_count="$(
 if [[ "$heal_function_count" != "$trace_heal_instrumentation_count" ]]; then
   echo "❌ logging guardrail violation: per-object heal instrumentation must be TRACE-only" >&2
   echo "found $heal_function_count per-object heal functions but $trace_heal_instrumentation_count TRACE spans" >&2
+  exit 1
+fi
+
+namespace_lock_file="crates/ecstore/src/set_disk/ops/locking.rs"
+namespace_lock_function_pattern='async fn new_ns_lock\('
+trace_namespace_lock_instrumentation_pattern='#\[tracing::instrument\(\s*level\s*=\s*"trace"[^]]*\)\]\s*async fn new_ns_lock\('
+namespace_lock_function_count="$(rg -c "$namespace_lock_function_pattern" "$namespace_lock_file" || true)"
+trace_namespace_lock_instrumentation_count="$(
+  rg -U -o "$trace_namespace_lock_instrumentation_pattern" "$namespace_lock_file" |
+    rg -c 'async fn new_ns_lock' || true
+)"
+trace_namespace_lock_instrumentation_count="${trace_namespace_lock_instrumentation_count:-0}"
+if [[ "$namespace_lock_function_count" != "$trace_namespace_lock_instrumentation_count" ]]; then
+  echo "❌ logging guardrail violation: per-object namespace-lock instrumentation must be TRACE-only" >&2
+  echo "found $namespace_lock_function_count namespace-lock functions but $trace_namespace_lock_instrumentation_count TRACE spans" >&2
   exit 1
 fi
 
