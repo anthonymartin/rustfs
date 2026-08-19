@@ -40,6 +40,9 @@ allow-git = [
     # SigV4 payload-checksum fix until it is available in a crates.io release.
     # owner: marshawcoco  review: 2026-10
     "https://github.com/s3s-project/s3s.git",
+    # MiMalloc fork pinned to the upstream multithreaded-crash fix.
+    # owner: houseme  review: 2026-10
+    "https://github.com/xonatius/mimalloc_rust.git",
     "https://github.com/apache/datafusion.git",
 ]
 
