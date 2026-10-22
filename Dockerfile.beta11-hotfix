@@ -41,7 +41,16 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     cargo fetch --locked
 
-RUN ./scripts/static.sh
+# Retain the 561 console files from production revision 9966a285; the generic
+# static.sh downloads a moving release and can change the beta.11 UI/API contract.
+RUN set -eux; \
+    find rustfs/static -mindepth 1 -delete; \
+    curl --fail --location \
+      https://github.com/anthonymartin/rustfs/releases/download/console-assets-9966a28563868710940452480b03e0541734564c/rustfs-console-production-9966a28563868710940452480b03e0541734564c.zip \
+      -o /tmp/rustfs-console.zip; \
+    echo "1b6f30271def02112ac49c77b4d3ed74808c9dd2cae607f40772fdb451619dc6  /tmp/rustfs-console.zip" | sha256sum -c -; \
+    unzip -q /tmp/rustfs-console.zip -d rustfs/static; \
+    rm /tmp/rustfs-console.zip
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/usr/src/rustfs/target/hotfix-build \
@@ -49,6 +58,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/usr/src/rustfs/target/hotfix-build \
+    cargo clean --release --target x86_64-unknown-linux-musl -p rustfs && \
     cargo build --locked --release --target x86_64-unknown-linux-musl -p rustfs --bin rustfs && \
     install -m 0755 \
       /usr/src/rustfs/target/hotfix-build/x86_64-unknown-linux-musl/release/rustfs \
