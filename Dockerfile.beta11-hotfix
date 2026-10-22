@@ -56,6 +56,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM $RUSTFS_BASE_IMAGE
 
+USER root
+RUN apk add --no-cache \
+      "ca-certificates>=20261020-r0" \
+      "ca-certificates-bundle>=20261020-r0"
+USER rustfs
+
 ARG BUILD_DATE
 ARG VCS_REF
 

@@ -1,0 +1,1 @@
+Public incident chains and roots from galadran/we-have-a-problem.com at e2786ff8b707b4951f0db1f83ccaf8ac9af2f7e6. The unrelated private test CA/leaf are synthetic public certificates; their ephemeral private keys are not retained. Verification uses 2026-10-22T04:00:00Z to keep expiry independent of test execution.
